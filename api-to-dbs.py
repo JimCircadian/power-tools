@@ -1,3 +1,5 @@
+import argparse
+import logging
 import requests.packages.urllib3
 requests.packages.urllib3.disable_warnings()
 import re
@@ -8,14 +10,16 @@ import time
 import requests
 import datetime
 import traceback
+import threading
+
 from multiprocessing import Pool
 from qumulo.rest_client import RestClient
 from collections import OrderedDict
 
-def log(msg, override=False):
-    if DEBUG:
-        t = datetime.datetime.utcnow()
-        print("%s - %s" % (t.strftime('%Y-%m-%dT%H:%M:%SZ'), msg))
+
+log = logging.info
+#TODO
+logging.getLogger().setLevel(logging.DEBUG)
 
 PG_SETUP_SQL = """CREATE TABLE IF NOT EXISTS qumulo_activity(
                 qumulo_host VARCHAR(128),
@@ -34,8 +38,8 @@ PG_SETUP_SQL = """CREATE TABLE IF NOT EXISTS qumulo_activity(
                 throughput_total FLOAT
                 );"""
 
-class QumuloActivityData:
 
+class QumuloActivityData:
     def __init__(self, cluster, conf):
         self.DIRECTORY_DEPTH_LIMIT = conf['DIRECTORY_DEPTH_LIMIT']
         self.IOPS_THRESHOLD = conf['IOPS_THRESHOLD']
@@ -67,7 +71,6 @@ class QumuloActivityData:
         self.combined_data = {}
         self.new_db_entries = []
 
-        self.pool = Pool(6)
         self.cluster = cluster
 
         log("Connect to Qumulo API for cluster: %s" % self.cluster['host'])
@@ -307,47 +310,95 @@ class QumuloActivityData:
                 self.ids_to_paths[inode_id]["is-dir"] = True
 
 
+def parse_args():
+    a = argparse.ArgumentParser()
+    a.add_argument("-c", "--continuous",
+                   help="Run continuously every n seconds (default: off)", default=None)
+
+    a.add_argument("config", help="JSON configuration to use")
+    return a.parse_args()
+
+
+def process_cluster_data(conf, cluster):
+    dbs = conf['DBS']
+    try:
+        qad = QumuloActivityData(cluster, conf)
+        qad.resolve_paths_and_ips()
+        qad.aggregate_data()
+        qad.prepare_data_for_dbs()
+
+        if "influx" in dbs:
+            from influxdb import InfluxDBClient
+            qad.load_data_into_influxdb(dbs["influx"])
+
+        if "csv" in conf['DBS']:
+            qad.load_data_into_csv(dbs["csv"])
+
+        if "postgres" in conf['DBS']:
+            import psycopg2
+            qad.load_data_into_postgres(dbs["postgres"])
+
+        if "elastic" in conf['DBS']:
+            from elasticsearch import Elasticsearch, helpers
+            qad.load_data_into_elastic_search(dbs["elastic"])
+
+        if "splunk" in conf['DBS']:
+            qad.load_data_into_splunk(dbs["splunk"])
+
+        # TODO: No whisper/carbon
+
+    except Exception as err:
+        logging.exception(sys.exc_info()[0])
+        logging.exception(sys.exc_info()[1])
+        logging.exception(traceback.format_exc())
+
+
+def cluster_acq_loop(conf, cluster, interval):
+    while True:
+        start = time.time()
+        process_cluster_data(conf, cluster)
+        end = time.time()
+
+        duration = end - start
+        if duration <= 0.:
+            logging.warning("Interval too low for continuous acquisition")
+        else:
+            time.sleep(float(interval) - duration)
+
 
 DEBUG = True
 
 if __name__ == "__main__":
+    args = parse_args()
     config_file = "config.json"
+
     try:
-        conf = json.loads(open(config_file, "r").read())
+        conf = json.loads(open(args.config, "r").read())
     except IOError as e:
-        log("*** Error reading config file: %s" % config_file, True)
-        log("*** Exception: %s" % e, True)
+        logging.exception("*** Error reading config file: %s" % args.config)
+        logging.exception("*** Exception: %s" % e)
         sys.exit()
     except ValueError as e:
-        log("*** Error parsing config file: %s" % config_file, True)
-        log("*** Exception: %s" % e, True)
+        logging.exception("*** Error parsing config file: %s" % args.config)
+        logging.exception("*** Exception: %s" % e)
         sys.exit()
 
-    QUMULO_CLUSTERS = conf['QUMULO_CLUSTERS']
-    DBS = conf['DBS']
     if 'DEBUG' in conf:
         DEBUG = conf['DEBUG']
-    for cluster in QUMULO_CLUSTERS:
-        try:
-            qad = QumuloActivityData(cluster, conf)
-            qad.resolve_paths_and_ips()
-            qad.aggregate_data()
-            qad.prepare_data_for_dbs()
-            if "influx" in DBS:
-                from influxdb import InfluxDBClient
-                qad.load_data_into_influxdb(DBS["influx"])
-            if "csv" in DBS:
-                qad.load_data_into_csv(DBS["csv"])
-            if "postgres" in DBS:
-                import psycopg2
-                qad.load_data_into_postgres(DBS["postgres"])
-            if "elastic" in DBS:
-                from elasticsearch import Elasticsearch, helpers
-                qad.load_data_into_elastic_search(DBS["elastic"])
-            if "splunk" in DBS:
-                qad.load_data_into_splunk(DBS["splunk"])
-        except Exception as err:
-            log("*** Exception ****", True)
-            log(sys.exc_info()[0], True)
-            log(sys.exc_info()[1], True)
-            log(traceback.format_exc(), True)
+
+    if not args.continuous:
+        for cluster in conf['QUMULO_CLUSTERS']:
+            process_cluster_data(conf, cluster)
+    else:
+        # NOTE: could get heavy with the multiprocessing pool, maybe warn unsuspecting users!
+        threads = [threading.Thread(daemon=True, target=cluster_acq_loop, args=(conf, cluster, args.continuous))
+                   for cluster in conf['QUMULO_CLUSTERS']]
+
+        for t in threads:
+            try:
+                t.start()
+            except RuntimeError:
+                logging.exception("*** Failed to start thread")
+
+        # TODO: Hacky, but it'll work for the mo
+        threads[-1].join()
