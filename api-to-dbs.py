@@ -360,10 +360,12 @@ def cluster_acq_loop(conf, cluster, interval):
         end = time.time()
 
         duration = end - start
-        if duration <= 0.:
+        sleep_for = float(interval) - duration
+
+        if sleep_for <= 0.:
             logging.warning("Interval too low for continuous acquisition")
         else:
-            time.sleep(float(interval) - duration)
+            time.sleep(sleep_for)
 
 
 DEBUG = True
